@@ -17,6 +17,9 @@ from config.config import global_config
 import configparser
 import threading
 from time import sleep,ctime
+from posthog_client import posthog_client
+from posthog_logs import posthog_log_logger
+
 config = configparser.ConfigParser()
 
 print('+++++++++++++++++++++++++++++++++++++++++++++++++++++++')
@@ -80,6 +83,25 @@ session.headers = {
     "Connection": "keep-alive"
 }
 manual_cookies = {}
+
+# A stable JD account identifier is not available at these capture sites yet.
+# Replace this marker with the verified identifier when the login flow exposes one.
+DISTINCT_ID = "DISTINCT_ID"
+
+
+def capture_event(event, properties):
+    """Capture an operational outcome without affecting the purchase workflow."""
+    if posthog_client is None:
+        return
+
+    try:
+        posthog_client.capture(
+            distinct_id=DISTINCT_ID,
+            event=event,
+            properties=properties,
+        )
+    except Exception as error:
+        logger.debug("PostHog capture failed: %s", error)
 
 
 def get_tag_value(tag, key='', index=0):
@@ -432,6 +454,22 @@ def submit_order(risk_control):
 
         if resp_json.get('success'):
             logger.info('订单提交成功! 订单号：%s', resp_json.get('orderId'))
+            capture_event(
+                "order_submitted",
+                {
+                    "submitted_item_count": resp_json.get("submitSkuNum", 0),
+                    "payment_password_configured": bool(payment_pwd),
+                },
+            )
+            posthog_log_logger.info(
+                "order submission completed",
+                extra={
+                    "event": "order_submission_completed",
+                    "status": "success",
+                    "submitted_item_count": resp_json.get("submitSkuNum", 0),
+                    "payment_password_configured": bool(payment_pwd),
+                },
+            )
             return True
         else:
             message, result_code = resp_json.get('message'), resp_json.get('resultCode')
@@ -444,6 +482,22 @@ def submit_order(risk_control):
                 message = message + '(需要在payment_pwd参数配置支付密码)'
             logger.info('订单提交失败, 错误码：%s, 返回信息：%s', result_code, message)
             logger.info(resp_json)
+            capture_event(
+                "order_submission_failed",
+                {
+                    "result_code": result_code,
+                    "payment_password_configured": bool(payment_pwd),
+                },
+            )
+            posthog_log_logger.error(
+                "order submission completed",
+                extra={
+                    "event": "order_submission_completed",
+                    "status": "failed",
+                    "result_code": result_code,
+                    "payment_password_configured": bool(payment_pwd),
+                },
+            )
             return False
     except Exception as e:
         logger.error(e)
@@ -737,6 +791,18 @@ class JDSpider:
              # 保存cookie
             with open('cookie', 'wb') as f:
                 pickle.dump(self.cookies, f)
+            capture_event(
+                "qr_login_completed",
+                {"authentication_method": "qr_code"},
+            )
+            posthog_log_logger.info(
+                "authentication completed",
+                extra={
+                    "event": "authentication_completed",
+                    "authentication_method": "qr_code",
+                    "status": "success",
+                },
+            )
             return True
 
         except Exception as e:
@@ -791,6 +857,15 @@ def is_item_removed(skuId):
     #return '该商品已下柜' not in page.text
     if('该商品已下柜' not in page.text):
         logger.info('[%s]类型口罩有货啦!马上下单', skuId)
+        capture_event("stock_detected", {"sku_id": skuId})
+        posthog_log_logger.info(
+            "stock detection completed",
+            extra={
+                "event": "stock_detection_completed",
+                "status": "in_stock",
+                "sku_id": skuId,
+            },
+        )
         skuidUrl = 'https://item.jd.com/' + skuId + '.html'
         if buyMask(skuId):
             #sendMail(mail, skuidUrl, True)
